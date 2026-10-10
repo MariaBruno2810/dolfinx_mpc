@@ -174,12 +174,7 @@ class MultiPointConstraint:
         else:
             codes = numpy.full(len(masters), -1, dtype=numpy.int32)
         if len(slaves) > 0:
-            self._offsets = numpy.append(self._offsets, offsets[1:] + len(self._masters))
-            self._slaves = numpy.append(self._slaves, slaves)
-            self._masters = numpy.append(self._masters, masters)
-            self._coeffs = numpy.array(numpy.append(self._coeffs, coeffs), dtype=self._dtype)
-            self._owners = numpy.append(self._owners, owners)
-            self._master_codes = numpy.append(self._master_codes, codes)
+            self._data = self._data.append(slaves, masters, coeffs, owners, offsets, codes)
 
     def _space_code(self, space: _fem.FunctionSpace) -> int:
         """The code of the block of the masters in `space`, recorded on every process in the same
@@ -190,6 +185,63 @@ class MultiPointConstraint:
         self._master_spaces.append(space)
         return -1 - len(self._master_spaces)
 
+    def extend_masters(
+        self,
+        slaves: npt.NDArray[numpy.int32],
+        masters: npt.NDArray[numpy.int64],
+        coeffs: _float_array_types,
+        owners: npt.NDArray[numpy.int32],
+        master_space: Optional[_fem.FunctionSpace] = None,
+    ):
+        r"""Add a master to the rows of existing slaves.
+
+        A row is the equation :math:`u_s = \sum_j c_j u_{m_j}` of its slave :math:`u_s`, whichever
+        constraint made it. Entry `i` adds a term :math:`k u_d` to its right-hand side, giving
+        :math:`u_s = \sum_j c_j u_{m_j} + k u_d`, with :math:`s` = `slaves[i]`,
+        :math:`u_d` = `masters[i]` and :math:`k` = `coeffs[i]`. If :math:`u_d` is already a master
+        of the row, in the same space, :math:`k` is added to its coefficient. The ghost copies of
+        the rows are extended too.
+
+        A call adds one term per slave. Further terms of the same slave are added by further calls,
+        each with its own `master_space`, so that a row may have masters in several spaces.
+
+        For instance, a periodic condition :math:`u(x) = u(\mathrm{relation}(x))` extended, by one
+        call per entry :math:`\bar H_{bk}` of a macroscopic gradient on a point mesh, with
+        coefficient :math:`d_k = (x - \mathrm{relation}(x))_k` for component :math:`b`, ties `u` to
+        :math:`\bar H x` plus a periodic field.
+
+        Args:
+            slaves: The slave of each entry: owned dofs of the space of the constraint (local,
+                unrolled), each already a slave and each at most once.
+            masters: The master of each entry, in the global (unrolled) numbering of `master_space`
+            coeffs: The coefficient of each entry, of the scalar type of the constraint
+            owners: The process owning each master
+            master_space: The space of the masters if not that of the constraint. It must be the
+                space of another constraint finalized together with this one by
+                :func:`finalize_multipointconstraints`, or an uncollapsed subspace of it.
+
+        Raises:
+            ValueError: On every process, if a slave is not owned, appears twice or has no row yet,
+                or the arrays differ in length.
+
+        Note:
+            Collective. Must be called by every process, with the same `master_space`, before the
+            constraint is finalized.
+        """
+        self._raise_if_finalized()
+        code = -1 if master_space is None else self._space_code(master_space)
+        # Raises ValueError (as the C++ throws std::invalid_argument), identically on every process
+        new_data = _cpp_function("extend_mpc_data", self._dtype)(
+            self._data._cpp_object,
+            -1,
+            numpy.asarray(slaves, dtype=numpy.int32),
+            numpy.asarray(masters, dtype=numpy.int64),
+            numpy.asarray(coeffs, dtype=self._dtype),
+            numpy.asarray(owners, dtype=numpy.int32),
+            code,
+            self.V._cpp_object,
+        )
+        self._data = MPCData.from_cpp(new_data)
     def add_integral_constraint(
         self,
         weight_form,
