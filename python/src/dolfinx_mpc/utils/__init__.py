@@ -12,6 +12,7 @@ from .mpc_utils import (
     create_normal_approximation,
     create_point_to_point_constraint,
     determine_closest_block,
+    dofs_at_point,
     facet_normal_approximation,
     log_info,
     rigid_motions_nullspace,
@@ -42,4 +43,5 @@ __all__ = [
     "determine_closest_block",
     "create_normal_approximation",
     "create_point_to_point_constraint",
+    "dofs_at_point",
 ]

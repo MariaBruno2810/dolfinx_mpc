@@ -16,6 +16,7 @@ import dolfinx.la as _la
 import dolfinx.log as _log
 import dolfinx.mesh as _mesh
 import numpy as np
+import numpy.typing as npt
 import ufl
 from dolfinx import default_scalar_type as _dt
 
@@ -29,6 +30,7 @@ __all__ = [
     "determine_closest_block",
     "create_normal_approximation",
     "create_point_to_point_constraint",
+    "dofs_at_point",
 ]
 
 
@@ -441,3 +443,79 @@ def create_normal_approximation(V: _fem.FunctionSpace, mt: _cpp.mesh.MeshTags_in
     n_cpp = dolfinx_mpc.cpp.mpc.create_normal_approximation(V._cpp_object, mt.dim, mt.find(value))
     nh._cpp_object = n_cpp
     return nh
+
+
+def dofs_at_point(
+    V: _fem.FunctionSpace, point: npt.ArrayLike, distance_tol: float | None = None
+) -> tuple[npt.NDArray[np.int64], int]:
+    """The global dofs of the block of `V` at a point, and the process owning them.
+
+    The dofs are in the global, unrolled numbering of the space `V` is an uncollapsed subspace of
+    (or of `V`),
+    as masters are given to :meth:`dolfinx_mpc.MultiPointConstraint.add_constraint` and
+    :meth:`dolfinx_mpc.MultiPointConstraint.extend_masters`: one per component of `V`. Works for a
+    space on a point mesh too.
+
+    Args:
+        V: The function space, or an uncollapsed subspace of it
+        point: The point, of `gdim` or 3 coordinates
+        distance_tol: The largest distance from the point to the dof. Defaults to `500` machine
+            epsilon of the coordinate type of the mesh.
+
+    Returns:
+        The dofs, one per component, and the owning process. The same on every process.
+
+    Raises:
+        ValueError: On every process, unless exactly one block of dofs of `V` is at the point:
+            none, or several, as in a discontinuous space or on a point mesh with coinciding
+            points.
+
+    Note:
+        Collective.
+    """
+    mesh = V.mesh
+    comm = mesh.comm
+    gdim = mesh.geometry.dim
+    if distance_tol is None:
+        distance_tol = 500 * float(np.finfo(mesh.geometry.x.dtype).eps)
+    p = np.zeros(3, dtype=np.float64)
+    given = np.asarray(point, dtype=np.float64).reshape(-1)
+    p[: len(given)] = given
+
+    def at_point(x):
+        return np.linalg.norm(x[:gdim].T - p[:gdim], axis=1) <= distance_tol
+
+    imap = V.dofmap.index_map
+    parent_bs = V.dofmap.index_map_bs
+    offset = imap.local_range[0] * parent_bs
+    num_owned = imap.size_local * parent_bs
+    is_sub = len(V.component()) > 0
+    # The dofs at the point (local, unrolled, in the numbering of the parent) and their component
+    if is_sub:
+        V_c = V.collapse()[0]
+        bs = V_c.dofmap.index_map_bs
+        parent_dofs, sub_dofs = _fem.locate_dofs_geometrical((V, V_c), at_point)
+        components = sub_dofs % bs
+        point_blocks = sub_dofs // bs
+    else:
+        bs = parent_bs
+        blocks = _fem.locate_dofs_geometrical(V, at_point)
+        parent_dofs = (blocks[:, None] * bs + np.arange(bs)).ravel()
+        components = np.tile(np.arange(bs), len(blocks))
+        point_blocks = np.repeat(blocks, bs)
+
+    # The point must hold exactly one block of V, counted on the process owning it. A
+    # discontinuous space, or a point mesh with coinciding points, may have several.
+    owned = parent_dofs < num_owned
+    num_blocks = np.array([len(np.unique(point_blocks[owned]))], dtype=np.int64)
+    comm.Allreduce(MPI.IN_PLACE, num_blocks, op=MPI.SUM)
+    if num_blocks[0] != 1:
+        raise ValueError(f"{num_blocks[0]} blocks of degrees of freedom of the space at {given}, not one")
+
+    # The dofs and the owner, in one reduction
+    found = np.full(bs + 1, -1, dtype=np.int64)
+    found[components[owned]] = offset + parent_dofs[owned]
+    if owned.any():
+        found[bs] = comm.rank
+    comm.Allreduce(MPI.IN_PLACE, found, op=MPI.MAX)
+    return found[:bs], int(found[bs])

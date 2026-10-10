@@ -106,17 +106,30 @@ class MPCData:
         coeffs: _float_array_types,
         owners: npt.NDArray[numpy.int32],
         offsets: npt.NDArray[numpy.int32],
+        master_blocks: Optional[npt.NDArray[numpy.int32]] = None,
     ):
+        """Rows of a constraint.
+
+        Args:
+            slaves: The slaves (local, unrolled)
+            masters: The masters of each slave (global, unrolled)
+            coeffs: The coefficient of each master
+            owners: The process owning each master
+            offsets: The masters of slave `i` are `masters[offsets[i]:offsets[i+1]]`
+            master_blocks: The block of each master, or `None` if every master is in the space
+                of the slaves. Given on every process or on none.
+        """
+        args = (slaves, masters, coeffs, owners, offsets, master_blocks)
         if coeffs.dtype.type == numpy.float32:
-            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_float(slaves, masters, coeffs, owners, offsets)
+            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_float(*args)
         elif coeffs.dtype.type == numpy.float64:
-            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_double(slaves, masters, coeffs, owners, offsets)
+            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_double(*args)
         elif coeffs.dtype.type == numpy.complex64:
-            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_complex_float(slaves, masters, coeffs, owners, offsets)
+            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_complex_float(*args)
         elif coeffs.dtype.type == numpy.complex128:
-            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_complex_double(slaves, masters, coeffs, owners, offsets)
+            self._cpp_object = dolfinx_mpc.cpp.mpc.mpc_data_complex_double(*args)
         else:
-            raise ValueError("Unsupported dtype {coeffs.dtype.type} for coefficients")
+            raise ValueError(f"Unsupported dtype {coeffs.dtype.type} for coefficients")
 
     @property
     def slaves(self):
@@ -137,3 +150,7 @@ class MPCData:
     @property
     def offsets(self):
         return self._cpp_object.offsets
+
+    @property
+    def master_blocks(self):
+        return self._cpp_object.master_blocks

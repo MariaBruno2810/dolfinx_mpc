@@ -1,4 +1,4 @@
-# Copyright (C) 2020-2023 Jørgen S. Dokken
+# Copyright (C) 2020-2026 Jørgen S. Dokken
 #
 # This file is part of DOLFINX_MPC
 #
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+from mpi4py import MPI as _MPI
 from petsc4py import PETSc as _PETSc
 
 import dolfinx.cpp as _cpp
@@ -67,7 +68,8 @@ class MultiPointConstraint:
     _coeffs: _float_array_types
     _owners: npt.NDArray[numpy.int32]
     _offsets: npt.NDArray[numpy.int32]
-    _master_spaces: List[tuple[npt.NDArray[numpy.int32], Optional[_fem.FunctionSpace]]]
+    _master_codes: npt.NDArray[numpy.int32]
+    _master_spaces: List[_fem.FunctionSpace]
     _bcs: List[_fem.DirichletBC]
     _rhs_coeffs: Optional[_fem.Function]
     _scale_function: Optional[_fem.Function]
@@ -94,6 +96,18 @@ class MultiPointConstraint:
         self._coeffs = numpy.array([], dtype=dtype)  # type: ignore
         self._owners = numpy.array([], dtype=numpy.int32)
         self._offsets = numpy.array([0], dtype=numpy.int32)
+        # Until finalize, the block of each master of the rows is given by a code, aligned with
+        # self._masters, as the blocks are known only when the constraints are finalized together:
+        #   code >= 0       the block itself, its position among the constraints finalized together
+        #   code == -1      the block of this constraint: a master in its own space
+        #   code == -2 - s  the block of the space self._master_spaces[s]
+        # finalize_multipointconstraints resolves the codes to blocks.
+        self._master_codes = numpy.array([], dtype=numpy.int32)
+        # The spaces of masters outside the space of this constraint, as given to add_constraint,
+        # add_constraint_from_mpc_data or extend_masters (master_space), each once, in the order
+        # first given. Every process appends them in the same order, also without local slaves,
+        # so that a code means the same space on every process. A space must be the space of one
+        # of the constraints finalized together with this one, or an uncollapsed subspace of it.
         self._master_spaces = []
         self._bcs = [] if bcs is None else list(bcs)
         if rhs_coeffs is not None:
@@ -145,7 +159,7 @@ class MultiPointConstraint:
 
             master_space: The function space all masters belong to, if not `V`. It must be the
                 space of another constraint finalized together with this one by
-                :func:`finalize_multipointconstraints`, or a subspace of it, and `masters` is in
+                :func:`finalize_multipointconstraints`, or an uncollapsed subspace of it, and `masters` is in
                 the global numbering of that constraint's space.
                 The masters of a slave may then be in another block of a blocked problem.
             master_blocks: The block of each master, for masters from several spaces: its position
