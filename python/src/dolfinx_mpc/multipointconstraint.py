@@ -63,12 +63,7 @@ class MultiPointConstraint:
             :math:`u_s = \\sum_j c_j u_{m_j} + g_s`.
     """
 
-    _slaves: npt.NDArray[numpy.int32]
-    _masters: npt.NDArray[numpy.int64]
-    _coeffs: _float_array_types
-    _owners: npt.NDArray[numpy.int32]
-    _offsets: npt.NDArray[numpy.int32]
-    _master_codes: npt.NDArray[numpy.int32]
+    _data: MPCData
     _master_spaces: List[_fem.FunctionSpace]
     _bcs: List[_fem.DirichletBC]
     _rhs_coeffs: Optional[_fem.Function]
@@ -91,18 +86,13 @@ class MultiPointConstraint:
         rhs_coeffs: Optional[_fem.Function] = None,
     ):
         dtype = _scalar_type(V.mesh.geometry.x.dtype, dtype)
-        self._slaves = numpy.array([], dtype=numpy.int32)
-        self._masters = numpy.array([], dtype=numpy.int64)
-        self._coeffs = numpy.array([], dtype=dtype)  # type: ignore
-        self._owners = numpy.array([], dtype=numpy.int32)
-        self._offsets = numpy.array([0], dtype=numpy.int32)
-        # Until finalize, the block of each master of the rows is given by a code, aligned with
-        # self._masters, as the blocks are known only when the constraints are finalized together:
+        # The rows on this process until finalize. Their master_blocks hold a code per master, as
+        # the blocks are known only when the constraints are finalized together:
         #   code >= 0       the block itself, its position among the constraints finalized together
         #   code == -1      the block of this constraint: a master in its own space
         #   code == -2 - s  the block of the space self._master_spaces[s]
         # finalize_multipointconstraints resolves the codes to blocks.
-        self._master_codes = numpy.array([], dtype=numpy.int32)
+        self._data = MPCData.empty(dtype, master_blocks=True)
         # The spaces of masters outside the space of this constraint, as given to add_constraint,
         # add_constraint_from_mpc_data or extend_masters (master_space), each once, in the order
         # first given. Every process appends them in the same order, also without local slaves,
