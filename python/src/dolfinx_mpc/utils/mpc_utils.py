@@ -131,7 +131,7 @@ def facet_normal_approximation(
         if bilinear_form.function_spaces[0].contains(bc_deac.function_space):
             dofs, owned = bc_deac.dof_indices()
         rows = np.array(dofs, dtype=np.int32)
-        _cpp.fem.petsc.set_diagonal(A, rows, 1.0, PETSc.InsertMode.INSERT_VALUES)  # type: ignore
+        _la.petsc.set_diagonal(A, rows, 1.0, PETSc.InsertMode.INSERT_VALUES)  # type: ignore
     A.assemble()
     linear_form = _fem.form(L, jit_options=jit_options, form_compiler_options=form_compiler_options)
     b = _fem.petsc.assemble_vector(linear_form)
