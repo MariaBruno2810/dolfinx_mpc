@@ -177,20 +177,28 @@ class MultiPointConstraint:
         if master_blocks is not None and len(master_blocks) != len(masters):
             raise ValueError("master_blocks must have one entry per master")
 
-        # Recorded on every process, also without local slaves, so that every process resolves the
-        # blocks of the masters the same way when the constraints are finalized
         if master_blocks is not None:
-            self._master_spaces.append((numpy.asarray(master_blocks, dtype=numpy.int32), None))
+            codes = numpy.asarray(master_blocks, dtype=numpy.int32)
         elif master_space is not None:
-            self._master_spaces.append((numpy.full(len(masters), -1, dtype=numpy.int32), master_space))
+            codes = numpy.full(len(masters), self._space_code(master_space), dtype=numpy.int32)
         else:
-            self._master_spaces.append((numpy.full(len(masters), -2, dtype=numpy.int32), None))
+            codes = numpy.full(len(masters), -1, dtype=numpy.int32)
         if len(slaves) > 0:
             self._offsets = numpy.append(self._offsets, offsets[1:] + len(self._masters))
             self._slaves = numpy.append(self._slaves, slaves)
             self._masters = numpy.append(self._masters, masters)
             self._coeffs = numpy.array(numpy.append(self._coeffs, coeffs), dtype=self._dtype)
             self._owners = numpy.append(self._owners, owners)
+            self._master_codes = numpy.append(self._master_codes, codes)
+
+    def _space_code(self, space: _fem.FunctionSpace) -> int:
+        """The code of the block of the masters in `space`, recorded on every process in the same
+        order so that every process resolves it the same way when the constraints are finalized."""
+        for s, other in enumerate(self._master_spaces):
+            if other is space:
+                return -2 - s
+        self._master_spaces.append(space)
+        return -1 - len(self._master_spaces)
 
     def add_integral_constraint(
         self,
