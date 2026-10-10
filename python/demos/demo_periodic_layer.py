@@ -52,8 +52,7 @@ from petsc4py import PETSc
 
 import numpy as np
 import ufl
-from dolfinx import default_scalar_type, fem, mesh, plot
-from dolfinx.fem import petsc as fem_petsc
+from dolfinx import default_real_type, default_scalar_type, fem, mesh, plot
 
 import dolfinx_mpc
 from dolfinx_mpc import MultiPointConstraint
@@ -81,7 +80,7 @@ parser.add_argument(
 )
 args, _ = parser.parse_known_args()  # parse_known_args: also runs inside Jupyter
 if args.stress is None:  # the average stress computed in `tension`, for the default --strain
-    args.stress = {"circle": 0.15371273, "ellipse": 0.1569839}[args.inclusion]
+    args.stress = {"circle": 0.15109879, "ellipse": 0.1563171}[args.inclusion]
 
 comm = MPI.COMM_WORLD
 dtype = np.dtype(default_scalar_type)
@@ -93,7 +92,9 @@ L = 1.0  # side of the square cell
 # The cell is the square $\Omega=(0,L)^2$ with corners
 #
 # $$
-# A=(0,0),\qquad B=(L,0),\qquad C=(L,L),\qquad D=(0,L).
+# \begin{aligned}
+# A &= (0,0), & B &= (L,0), & C &= (L,L), & D &= (0,L).
+# \end{aligned}
 # $$
 #
 # As in the
@@ -104,11 +105,14 @@ L = 1.0  # side of the square cell
 
 # +
 N = 32
-domain = mesh.create_rectangle(comm, [[0, 0], [L, L]], [N, N])
+# Crossed: each square is cut into four triangles, so the mesh has the symmetries of the square
+domain = mesh.create_rectangle(
+    comm, [[0, 0], [L, L]], [N, N], diagonal=mesh.DiagonalType.crossed, dtype=default_real_type
+)
 gdim = tdim = domain.geometry.dim
 
 E_uniform, nu = 10.0, 0.3
-E = fem.Function(fem.functionspace(domain, ("Discontinuous Lagrange", 0)))
+E = fem.Function(fem.functionspace(domain, ("Discontinuous Lagrange", 0)), dtype=dtype)
 midpoints = mesh.compute_midpoints(domain, tdim, np.arange(domain.topology.index_map(tdim).size_local, dtype=np.int32))
 if args.inclusion == "circle":
     inclusion = (midpoints[:, 0] - 0.5) ** 2 + (midpoints[:, 1] - 0.5) ** 2 < 0.25**2
@@ -117,10 +121,12 @@ else:  # ellipse with semi-axes 0.38 and 0.15, inclined at 30 degrees
     xr = c30 * (midpoints[:, 0] - 0.5) + s30 * (midpoints[:, 1] - 0.5)
     yr = -s30 * (midpoints[:, 0] - 0.5) + c30 * (midpoints[:, 1] - 0.5)
     inclusion = (xr / 0.38) ** 2 + (yr / 0.15) ** 2 < 1.0
+cells0 = np.flatnonzero(inclusion).astype(np.int32)  # the owned cells of the inclusion
 
 
 def set_young_modulus(E_inclusion: float):
-    E.x.array[: len(inclusion)] = np.where(inclusion, E_inclusion, E_uniform)
+    E.interpolate(lambda x: np.full(x.shape[1], E_uniform))
+    E.interpolate(lambda x: np.full(x.shape[1], E_inclusion), cells0=cells0)
     E.x.scatter_forward()
 
 
@@ -150,9 +156,11 @@ rhs = ufl.inner(fem.Constant(domain, np.zeros(gdim, dtype=dtype)), v_) * ufl.dx
 # Fixing $\mathbf{u}^A=\mathbf{0}$ to remove the rigid translation, the constraints are
 #
 # $$
-# \mathbf{u}^A=\mathbf{0},\qquad
-# \mathbf{u}^{\text{RIGHT}} = \mathbf{u}^{\text{LEFT}} + \mathbf{u}^B,\qquad
-# \mathbf{u}^C = \mathbf{u}^D + \mathbf{u}^B,
+# \begin{aligned}
+# \mathbf{u}^A &= \mathbf{0},\\
+# \mathbf{u}^{\text{RIGHT}} &= \mathbf{u}^{\text{LEFT}} + \mathbf{u}^B,\\
+# \mathbf{u}^C &= \mathbf{u}^D + \mathbf{u}^B,
+# \end{aligned}
 # $$ (eq:1d-periodic)
 #
 # where RIGHT and LEFT are the edges without their corners. The corner $C$ needs its own
@@ -178,28 +186,32 @@ rhs = ufl.inner(fem.Constant(domain, np.zeros(gdim, dtype=dtype)), v_) * ufl.dx
 # satisfies {eq}`eq:1d-periodic` the work of the tractions on LEFT $\cup$ RIGHT reduces to
 #
 # $$
-# \int_{\text{LEFT}\cup\text{RIGHT}}\mathbf{T}\cdot\mathbf{v}\,\mathrm{d}s
-# = \int_{\text{RIGHT}}\mathbf{T}(\mathbf{X})\cdot
-#   \bigl(\mathbf{v}(\mathbf{X})-\mathbf{v}(\mathbf{X}-L\mathbf{e}_x)\bigr)\,\mathrm{d}s
-# = \int_{\text{RIGHT}}\mathbf{T}\cdot\mathbf{v}^B\,\mathrm{d}s
-# = \mathbf{F}\cdot\mathbf{v}^B,
-# \qquad \mathbf{F}=\int_{\text{RIGHT}}\mathbf{T}\,\mathrm{d}s .
+# \begin{aligned}
+# \int_{\text{LEFT}\cup\text{RIGHT}}\mathbf{T}\cdot\mathbf{v}~\mathrm{d}s
+# &= \int_{\text{RIGHT}}\mathbf{T}(\mathbf{X})\cdot
+#   \bigl(\mathbf{v}(\mathbf{X})-\mathbf{v}(\mathbf{X}-L\mathbf{e}_x)\bigr)~\mathrm{d}s
+# = \int_{\text{RIGHT}}\mathbf{T}\cdot\mathbf{v}^B~\mathrm{d}s
+# = \mathbf{F}\cdot\mathbf{v}^B,\\
+# \mathbf{F} &= \int_{\text{RIGHT}}\mathbf{T}~\mathrm{d}s .
+# \end{aligned}
 # $$ (eq:1d-work)
 #
 # BOTTOM and TOP are traction-free, so the principle of virtual work reads
 #
 # $$
-# \int_\Omega \boldsymbol{\sigma}(\mathbf{u}):\boldsymbol{\epsilon}(\mathbf{v})\,\mathrm{d}\Omega
+# \int_\Omega \boldsymbol{\sigma}(\mathbf{u}):\boldsymbol{\epsilon}(\mathbf{v})~\mathrm{d}x
 # = \mathbf{F}\cdot\mathbf{v}^B
 # $$
 #
 # for all $\mathbf{v}$ satisfying {eq}`eq:1d-periodic` and vanishing where $\mathbf{u}$ is
 # prescribed. The right-hand side is the virtual work of a point force $\mathbf{F}$ applied at
-# $B$: a prescribed $F_i$ is a **nodal force** on $u^B_i$, which becomes an unknown. With
+# $B$: a prescribed $F_i$ is a **nodal force** on $u^B_i$, which becomes an unknown. In the code it
+# is a vertex integral over $B$, $\int_{\{B\}}\mathbf{F}\cdot\mathbf{v}~\mathrm{d}P$, added to the
+# linear form with the measure `ufl.dP`. With
 # $\operatorname{div}\boldsymbol{\sigma}=\mathbf{0}$, the divergence theorem gives
 #
 # $$
-# \int_\Omega \sigma_{i1}\,\mathrm{d}\Omega = L\,F_i + \int_{\text{BOTTOM}\cup\text{TOP}} T_i X_1\,\mathrm{d}s .
+# \int_\Omega \sigma_{i1}~\mathrm{d}x = L\,F_i + \int_{\text{BOTTOM}\cup\text{TOP}} T_i X_1~\mathrm{d}s .
 # $$
 #
 # With traction-free faces $F_i=L\,\bar\sigma_{i1}$: in `tension-stress` we prescribe
@@ -218,7 +230,8 @@ F_B = np.array([L * args.stress, 0.0]) if stress_control else np.zeros(2)  # nod
 if comm.rank == 0:
     print(f"load = {args.load}, G = {G.tolist()}, F_B = {F_B.tolist()}")
 
-tol = 1e-10 * L
+# Largest distance between a node and a point it is located at, from the rounding of the coordinates
+tol = 500 * np.finfo(domain.geometry.x.dtype).eps * L
 
 
 def near(a, b):
@@ -240,7 +253,7 @@ def affine_bc(component: int, marker):
     """DirichletBC u_c = (G X)_c on the dofs selected by `marker`."""
     Vc, _ = V.sub(component).collapse()
     dofs = fem.locate_dofs_geometrical((V.sub(component), Vc), marker)
-    g = fem.Function(Vc)
+    g = fem.Function(Vc, dtype=dtype)
     g.interpolate(lambda x: G[component, 0] * x[0] + G[component, 1] * x[1])
     return fem.dirichletbc(g, dofs, V.sub(component))
 
@@ -257,70 +270,42 @@ else:
 
 # ## Multi-point constraints
 #
-# ### Known jump: `tension` and `shear`
+# Every constraint of {eq}`eq:1d-periodic` has the same form: a node on RIGHT, or the corner $C$,
+# equals its image one period to the left, plus $\mathbf{u}^B$. It is built in two steps, for
+# every load case:
 #
-# The jump is known: $\mathbf{u}^B=(\bar\varepsilon L,0)$ in `tension`, $\mathbf{u}^B=\mathbf{0}$ in
-# `shear`. The constraint on
-# RIGHT is therefore a periodic constraint with a constant term,
-# $\mathbf{u}^{\text{RIGHT}}=\mathbf{u}^{\text{LEFT}}+\mathbf{g}$ with $\mathbf{g}=\mathbf{u}^B$. As in
-# the {doc}`periodic homogenization demo <demo_periodic_homogenization>`, it is built with
-# {py:meth}`create_periodic_constraint_geometrical
-# <dolfinx_mpc.MultiPointConstraint.create_periodic_constraint_geometrical>`. The constant term is
-# supplied as a function `g` to the constructor of
-# {py:class}`MultiPointConstraint <dolfinx_mpc.MultiPointConstraint>`: it equals $\mathbf{u}^B$ on
-# RIGHT and zero elsewhere.
+# 1. {py:meth}`create_periodic_constraint_geometrical
+#    <dolfinx_mpc.MultiPointConstraint.create_periodic_constraint_geometrical>` ties each such node
+#    to its image, $\mathbf{u}(\mathbf{X})=\mathbf{u}(\mathbf{X}-L\mathbf{e}_x)$: RIGHT to LEFT, and
+#    $C$ to $D$.
+# 2. {py:meth}`add_master_from_point <dolfinx_mpc.MultiPointConstraint.add_master_from_point>` adds
+#    the dofs at $B$, with coefficient $1$, to the right-hand side of each of these constraints,
+#    component by component.
 #
-# The corner equation $\mathbf{u}^C=\mathbf{u}^D+\mathbf{u}^B$ has two masters, the free corner
-# $D$ and the prescribed corner $B$. It is built with
-# {py:meth}`create_general_constraint <dolfinx_mpc.MultiPointConstraint.create_general_constraint>`,
-# which takes the slave and its masters by coordinates. DOLFINx-MPC removes the Dirichlet master
-# $B$ from the list and folds its value into the constraint. In `shear` the corner $C$ lies on the
-# prescribed face TOP, so its Dirichlet value already satisfies the equation. A dof cannot be both
-# a slave and a Dirichlet dof, so the corner constraint is only added in `tension`.
+# What differs between the load cases are the Dirichlet conditions, passed as `bcs` to the
+# constraint:
 #
-# ### Unknown jump: `tension-stress`
-#
-# Now $u^B_x$ is unknown, so the constraint $u_x^{\text{RIGHT}}=u_x^{\text{LEFT}}+u_x^B$ has *two*
-# masters: the periodic partner and $B$. Both components of RIGHT, and the corner $C$, are
-# therefore built with `create_general_constraint`. For $u_y$ the master $B$ carries the
-# Dirichlet condition $u^B_y=0$, and DOLFINx-MPC folds it into the constraint. For $u_x$ it stays
-# a master, i.e. a degree of freedom of the reduced system. Every rank needs the full list of
-# slaves, so their coordinates are gathered from all processes.
+# * In `tension` the jump $\mathbf{u}^B=(\bar\varepsilon L,0)$ is prescribed by a Dirichlet
+#   condition on $B$, and DOLFINx-MPC folds the value of this master into the constraint.
+# * In `shear` $B$ lies on BOTTOM and $C$ on TOP, both prescribed. The jump $\mathbf{u}^B=\mathbf{0}$
+#   is folded in as above, and $C$ is not a slave: a dof cannot be both a slave and a Dirichlet dof,
+#   and its Dirichlet value already satisfies its equation.
+# * In `tension-stress` only $u^B_y=0$ is prescribed and folded in. $u^B_x$ stays a master, a
+#   degree of freedom of the reduced system, on which the nodal force $F_x$ acts.
 
 
 # +
-def key(point) -> bytes:
-    return np.array([point[0], point[1], 0.0], dtype=domain.geometry.x.dtype).tobytes()
+def slave_nodes(x):
+    """RIGHT, and the corner C unless it lies on a prescribed face."""
+    on_C = at_point(*C)(x) if args.load != "shear" else np.zeros(x.shape[1], dtype=bool)
+    return right_open(x) | on_C
 
 
-uB = G @ np.array([L, 0.0])
-
-
-def offset(x):
-    values = np.zeros((gdim, x.shape[1]), dtype=dtype)
-    values[:, right_open(x)] = uB.reshape(-1, 1)
-    return values
-
-
-x_dofs = V.tabulate_dof_coordinates()
-if stress_control:
-    mpc = MultiPointConstraint(V, dtype=dtype, bcs=bcs)
-    slaves = np.unique(np.round(np.vstack(comm.allgather(x_dofs[right_open(x_dofs.T)])), 14), axis=0)
-    for c in range(gdim):
-        slave_master = {key(xs): {key((0.0, xs[1])): 1.0, key(B): 1.0} for xs in slaves}
-        slave_master[key(C)] = {key(D): 1.0, key(B): 1.0}
-        mpc.create_general_constraint(slave_master, subspace_slave=c, subspace_master=c)
-else:
-    g = fem.Function(V, dtype=dtype)
-    g.interpolate(offset)
-    g.x.scatter_forward()
-    mpc = MultiPointConstraint(V, dtype=dtype, bcs=bcs, rhs_coeffs=g)
-    mpc.create_periodic_constraint_geometrical(
-        V, right_open, lambda x: np.vstack([x[0] - L, x[1], x[2]]), bcs, scale=dtype.type(1.0)
-    )
-    if args.load == "tension":
-        for c in range(gdim):
-            mpc.create_general_constraint({key(C): {key(D): 1.0, key(B): 1.0}}, subspace_slave=c, subspace_master=c)
+mpc = MultiPointConstraint(V, dtype=dtype, bcs=bcs)
+mpc.create_periodic_constraint_geometrical(
+    V, slave_nodes, lambda x: np.vstack([x[0] - L, x[1], x[2]]), bcs, scale=dtype.type(1.0)
+)
+mpc.add_master_from_point(V, slave_nodes, 1.0, B)
 mpc.finalize()  # collective: every rank must reach this
 # -
 
@@ -330,13 +315,13 @@ mpc.finalize()  # collective: every rank must reach this
 # cell,
 #
 # $$
-# \bar{\boldsymbol{\sigma}} = \frac{1}{|\Omega|}\int_\Omega \boldsymbol{\sigma}\,\mathrm{d}\Omega ,
+# \bar{\boldsymbol{\sigma}} = \frac{1}{|\Omega|}\int_\Omega \boldsymbol{\sigma}~\mathrm{d}x ,
 # $$
 #
 # and the macroscopic strain, the volume average of $\boldsymbol{\epsilon}$,
 #
 # $$
-# \bar{\mathbf{E}}^{\text{eff}} = \frac{1}{|\Omega|}\int_\Omega \boldsymbol{\epsilon}(\mathbf{u})\,\mathrm{d}\Omega ,
+# \bar{\mathbf{E}}^{\text{eff}} = \frac{1}{|\Omega|}\int_\Omega \boldsymbol{\epsilon}(\mathbf{u})~\mathrm{d}x ,
 # $$
 #
 # which is the strain that pairs with $\bar{\boldsymbol{\sigma}}$. Its component
@@ -352,56 +337,63 @@ mpc.finalize()  # collective: every rank must reach this
 
 
 # +
-def assemble(form) -> float:
-    return comm.allreduce(fem.assemble_scalar(fem.form(form)), op=MPI.SUM)
+def assemble_scalar_global(form: fem.Form):
+    """The value of a compiled scalar form, summed over all processes."""
+    return comm.allreduce(fem.assemble_scalar(form), op=MPI.SUM)
 
 
-a_form, rhs_form = fem.form(a), fem.form(rhs)
-dof_Bx = fem.locate_dofs_geometrical((V.sub(0), V.sub(0).collapse()[0]), at_point(*B))[0]
-n_owned = V.dofmap.index_map.size_local * V.dofmap.index_map_bs
+# The nodal force F_B of eq:1d-work on the corner B, as a vertex integral in the linear form. Under
+# `tension` and `shear` it is zero; under `tension-stress` its x component acts on the free master
+# u^B_x, and its y component on u^B_y = 0 is removed by the Dirichlet condition.
+TAG_B = 1
+vertices_B = mesh.locate_entities_boundary(domain, 0, at_point(*B))
+corner_tag = mesh.meshtags(domain, 0, vertices_B, np.full(len(vertices_B), TAG_B, dtype=np.int32))
+dP = ufl.Measure("dP", domain=domain, subdomain_data=corner_tag)
+nodal_force = fem.Constant(domain, F_B.astype(dtype))
+problem = dolfinx_mpc.LinearProblem(
+    a,
+    rhs + ufl.inner(nodal_force, v_) * dP(TAG_B),
+    mpc,
+    bcs=bcs,
+    petsc_options={
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+        "pc_factor_mat_solver_type": "mumps",
+        "ksp_error_if_not_converged": True,
+    },
+)
 
 
-def solve() -> fem.Function:
-    """Assemble and solve as dolfinx_mpc.LinearProblem does, adding the nodal force F_B
-    of eq:1d-work on the free master dof u^B_x (zero unless the jump is stress-controlled)."""
-    mpc.update_constants()
-    Amat = dolfinx_mpc.assemble_matrix(a_form, mpc, bcs=bcs)
-    Amat.assemble()
-    b = dolfinx_mpc.assemble_vector(rhs_form, mpc)
-    dolfinx_mpc.apply_lifting(b, [a_form], bcs=[bcs], constraint=mpc)
-    dolfinx_mpc.apply_mpc_lifting(b, [a_form], constraint=mpc)
-    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-    fem_petsc.set_bc(b, bcs)
-    b.array[dof_Bx[dof_Bx < n_owned]] += F_B[0]  # on the process that owns B
-    b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-    ksp = PETSc.KSP().create(comm)
-    ksp.setOperators(Amat)
-    ksp.setType("preonly")
-    ksp.getPC().setType("lu")
-    ksp.getPC().setFactorSolverType("mumps")
-    ksp.setErrorIfNotConverged(True)
-    uh = fem.Function(mpc.function_space)
-    ksp.solve(b, uh.x.petsc_vec)
-    uh.x.scatter_forward()
-    mpc.homogenize(uh)
-    mpc.backsubstitution(uh)
-    ksp.destroy(), Amat.destroy(), b.destroy()
-    return uh
+# The averages are taken for the solutions of several problems, so their forms are compiled once,
+# for a function in V that `average` fills: the leading entries of a constraint space are those of V
+u_avg = fem.Function(V, dtype=dtype)
+
+
+def tensor_forms(T) -> list[list[fem.Form]]:
+    return [[fem.form(T[i, j] * ufl.dx, dtype=dtype) for j in range(gdim)] for i in range(gdim)]
+
+
+stress_forms, gradient_forms = tensor_forms(sigma(u_avg)), tensor_forms(ufl.grad(u_avg))
+
+
+def average(forms: list[list[fem.Form]], u: fem.Function) -> np.ndarray:
+    """The volume average of the tensor of `forms` for the solution `u`."""
+    u_avg.x.array[:] = u.x.array[: u_avg.x.array.size]
+    return np.array([[assemble_scalar_global(f) for f in row] for row in forms]).real / L**2
 
 
 def average_stress(u: fem.Function) -> np.ndarray:
-    s = sigma(u)
-    return np.array([[assemble(s[i, j] * ufl.dx) for j in range(gdim)] for i in range(gdim)]) / L**2
+    return average(stress_forms, u)
 
 
 def average_strain(u: fem.Function) -> np.ndarray:
-    e = epsilon(u)
-    return np.array([[assemble(e[i, j] * ufl.dx) for j in range(gdim)] for i in range(gdim)]) / L**2
+    """The symmetric part of the average gradient."""
+    G_avg = average(gradient_forms, u)
+    return 0.5 * (G_avg + G_avg.T)
 
 
 def average_gradient(u: fem.Function) -> np.ndarray:
-    G_u = ufl.grad(u)
-    return np.array([[assemble(G_u[i, j] * ufl.dx) for j in range(gdim)] for i in range(gdim)]) / L**2
+    return average(gradient_forms, u)
 
 
 mu_uniform = E_uniform / (2 * (1 + nu))
@@ -423,9 +415,9 @@ mu_uniform = E_uniform / (2 * (1 + nu))
 
 # +
 set_young_modulus(E_uniform)
-uh = solve()
+uh = problem.solve()
 k = nu / (1 - nu)
-u_exact = fem.Function(V)
+u_exact = fem.Function(V, dtype=dtype)
 
 
 def exact(x):
@@ -438,10 +430,12 @@ def exact(x):
 
 
 u_exact.interpolate(exact)
-error = np.sqrt(assemble(ufl.inner(uh - u_exact, uh - u_exact) * ufl.dx))
+error = np.sqrt(abs(assemble_scalar_global(fem.form(ufl.inner(uh - u_exact, uh - u_exact) * ufl.dx, dtype=dtype))))
+norm_exact = np.sqrt(abs(assemble_scalar_global(fem.form(ufl.inner(u_exact, u_exact) * ufl.dx, dtype=dtype))))
 if comm.rank == 0:
     print(f"---- Homogeneous cell ----\n  L2(u_h - u_exact) = {error:.3e}  (should be round-off)")
-assert error < 1e-10
+# Relative to the size of the solution, with a bound from the precision of the mesh coordinates
+assert error < 50 * np.sqrt(np.finfo(domain.geometry.x.dtype).resolution) * norm_exact
 # -
 
 # ### Rotation constraint and a cell without symmetry
@@ -458,7 +452,7 @@ assert error < 1e-10
 
 # +
 set_young_modulus(50.0 * E_uniform)
-uh = solve()
+uh = problem.solve()
 sigma_bar, E_eff = average_stress(uh), average_strain(uh)
 if comm.rank == 0:
     print("---- Heterogeneous cell ----")
@@ -507,9 +501,9 @@ except ModuleNotFoundError:
 
 if pyvista is not None:
     owned = np.arange(domain.topology.index_map(tdim).size_local, dtype=np.int32)
-    u_plot = fem.Function(V)
+    u_plot = fem.Function(V, dtype=dtype)
     u_plot.x.array[:] = uh.x.array[: u_plot.x.array.size]
-    w_plot = fem.Function(V)
+    w_plot = fem.Function(V, dtype=dtype)
     H_eff = average_gradient(uh)
     w_plot.interpolate(lambda x: H_eff @ x[:gdim])
     w_plot.x.array[:] = u_plot.x.array - w_plot.x.array
@@ -585,3 +579,8 @@ if pyvista is not None:
 #    :labelprefix:
 #    :keyprefix: layer-
 # ```
+
+# +
+del problem
+PETSc.garbage_cleanup(comm)
+# -
